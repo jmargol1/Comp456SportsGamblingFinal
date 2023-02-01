@@ -1,0 +1,512 @@
+---
+title: 'Taking the Sports out of Sports Gambling: Arbitrage and Expected Value Betting'
+author: "Joe Margolis and Declan Elias"
+date: '2022-11-14'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tidymodels)
+library(vip)
+library(probably) #install.packages('probably')
+tidymodels_prefer()
+conflicted::conflict_prefer("vi", "vip")
+library(rpart.plot)
+library(plotly)
+library(rfviz)
+library(tree.interpreter)
+library(kableExtra)
+```
+
+## Introduction
+
+### Topic
+
+A rapid occurrence across the United States that is currently taking place is the continuous legalization of sports gambling passing through state governments. With 30 states already passing laws allowing sports betting, the business itself has exploded as it has even become a major area of investment for the sports franchises themselves, as they open up books in stadiums and partnerships with books are being put in place. This rapid growth in influence of sports betting, along with Declan Elias and my interests in statistical analysis and sports in general is the reason why we have decided to explore this topic in this report.
+
+### Research Questions
+
+Our research questions revolve around finding two ways to maximize expected value of betting, and doing so in a way to where over time a gambler can actually expect to slowly earn a profit. The idea is treating sports gambling more like stock trade as opposed to game, finding comparisons within games and books in order to place bets with opportunity for slow success.
+
+#### Expected Value Across Books
+
+The first way we attempt to profit off of expected value is by comparing a certain game across books. There are hundreds of books out there, and while there is plenty of model sharing and line sharing amongst them, there are still many instances where books produce different lines for the same game. With this in mind we are attempting to put together a model that weighs the success of each book differently based on their history, and use that to set a "gold standard" line for any particular game. This would hopefully allow us to have a consistent baseline model that we can count as an even expected value, and then compare book lines to that model to see which books can give us a positive expected value.
+
+#### Expected Value As Lines Move
+
+The other way we are investigating in order to leverage expected value betting is through the way that lines can change within a given book. In many sports, particularly sports like football which only play once a week, we can notice an abundance of changes in the lines a book offers from the first line they set up until game time, when the book has the most knowledge. Books will try to adjust lines in order to end up with as close to a 50/50 split on all bets from the public. What we are attempting with this is to model how these lines tend to move, leading to a classification output where we decide if a given line is going to be better or worse than its closing value, allowing a gambler to decide if a current bet is a good idea.
+
+## Data 
+
+The main datasets used are `consensus_data`, `ml_data_all`, and `NFL_movement_split_df`. All of these can be loaded from the repository and were taken from ActionNetwork.com
+
+## Expected Value Accross Books
+
+### Distribution of Implied Win Probability
+
+```{r warning=FALSE}
+load("consensus_data.rdata")
+create_ml_prob_hist = function(league) {
+  return(
+    consensus_data %>%
+      filter(league_name == league) %>%
+      filter(book_id == 30) %>%
+      ggplot(aes(x = ml_home_implied_prob)) +
+      geom_histogram(binwidth = .02) +
+      theme_minimal() +
+      labs(title = paste("Home Money Line in", toupper(league)), xlab = "Implied Probability",
+           x = "Implied Home Win Probability",
+           y = "Count")
+  )
+}
+load("CLV_Analysis/MLB_Data/MLB_movement_split_df.rdata")
+MLB_Full <- MLB_lines_split %>%
+  select(-Index, -inserted, -league, -id, -Final_line, -public_team_under, -book_id) %>%
+  na.omit()
+```
+
+This plot shows the distribution of the implied home win probability. In the MLB and NHL we see a relatively normal distribution, however, with the NFL and NBA, we see slightly less normality. In the two college leagues, we do not see a normal distribution.
+
+### Reliability Plot
+
+```{r}
+ml_data = consensus_data %>%
+  filter(book_id == 30,
+         !is.na(winning_team_id),
+         !is.na(ml_home_implied_prob)) %>%
+  select(id, away_team_id, home_team_id, winning_team_id, league_name, season, ml_away, ml_home, ml_home_implied_prob, ml_away_implied_prob) %>%
+  mutate(home_team_win = if_else(winning_team_id == home_team_id, TRUE, FALSE))
+ml_data_by_sport = ml_data %>%
+  group_by(league_name) %>%
+  mutate(bins = cut_number(ml_home_implied_prob, 10)) %>%
+  ungroup()
+  
+ml_data_by_sport %>%
+  group_by(league_name, bins) %>%
+  summarise(x = mean(ml_home_implied_prob),
+            
+            y = mean(home_team_win),
+            n = n()) %>%
+  ggplot(aes(x=x, y=y, color=league_name)) +
+  geom_abline(slope = 1, color = "black", lty = 2) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~league_name) +
+  theme_bw() +
+  labs(title = "Consensus Home Implied Win Probability Vs. True Win Probability", x = "Implied Home Win Probability", y = "True Home Win Probability")
+```
+
+This graph shows the implied win probability vs. true win probability for the 6 leagues. In general, the books are very good at accurately predicting the outcome of the games.
+
+
+```{r}
+ml_data_by_sport %>%
+  group_by(bins, season) %>%
+  summarise(x = mean(ml_home_implied_prob),
+            y = mean(home_team_win),
+            n = n()) %>%
+  ggplot(aes(x=x, y=y, color=season)) +
+  geom_abline(slope = 1, color = "black", lty = 2) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~season) +
+  theme_bw() +
+  labs(title = "Consensus Home Implied Win Probability Vs. True Win Probability", x = "Implied Home Win Probability", y = "True Home Win Probability")
+```
+
+This graph shows the implied win probability vs. true win probability over time. There is no trend based on year.
+
+
+### Looking at Individual Books
+
+#### How Data Set Is Created
+```{r eval=FALSE, include=TRUE}
+load("CLV_Analysis/betting_data.rdata")
+ml_data_all = betting_data %>%
+  select(id, away_team_id, home_team_id, winning_team_id, league_name, season, ml_away, ml_home, ml_home_implied_prob, ml_away_implied_prob, book_id) %>%
+  filter(!is.na(winning_team_id),
+         !is.na(ml_home_implied_prob))
+ml_data_all = ml_data_all %>%
+  mutate(home_team_win = if_else(winning_team_id == home_team_id, TRUE, FALSE)) %>%
+  mutate(favorite_win_prob = pmax(ml_home_implied_prob, ml_away_implied_prob),
+         favorite_home = if_else(favorite_win_prob == ml_home_implied_prob, T, F),
+         favorite_win = if_else((favorite_home & home_team_win) | (!favorite_home & !home_team_win), T, F),
+         brier_score = (favorite_win_prob - favorite_win) ^ 2 + (1 - favorite_win_prob - !favorite_win)^2)
+rm(betting_data)
+```
+
+
+```{r warning=FALSE}
+load("ml_data_all.rdata")
+brier_data = ml_data_all %>%
+  group_by(league_name, book_id) %>%
+  summarise(brier_score = mean(brier_score),
+            n = n())
+brier_ref = brier_data %>%
+  group_by(league_name) %>%
+  summarise(brier_score = mean(brier_score))
+get_brier_ss = function(this.league_name, brier_score) {
+  ref_score = brier_ref %>%
+    filter(league_name == this.league_name)
+  
+  return(1 -  brier_score / ref_score$brier_score)
+}
+brier_data = brier_data %>%
+  group_by(league_name, book_id) %>%
+  mutate(brier_skill_score = get_brier_ss(league_name, brier_score)) %>% 
+  ungroup()
+brier_data %>%
+  ggplot(aes(x = brier_skill_score, color = league_name)) +
+  geom_histogram(binwidth = .01) +
+  facet_wrap(~league_name) + 
+  theme_minimal() +
+  labs(x = "Brier Skill Score", y = "Count", title = "Distribution of Books When Compared To The Average")
+```
+
+This graphic shows how the distribution of how the books perform compared to the average. A Brier Skill Score ($1 - \frac{BS_{average}}{BS_{book}}$) below 0 indicates a book performance is below average, a score above 0 indicates a performance above average. 
+
+
+```{r}
+brier_data %>%
+  filter(league_name == "ncaaf") %>%
+  arrange((brier_skill_score))
+
+
+ml_data_all %>%
+  filter(book_id == 55 | book_id == 60,
+         league_name == "ncaaf") %>%
+  mutate(winning_team_prob = if_else(home_team_win, ml_home_implied_prob, ml_away_implied_prob),
+         losing_team_prob = if_else(home_team_win, ml_away_implied_prob, ml_home_implied_prob)) %>%
+  ggplot(aes(x = winning_team_prob, group = book_id, color = as.factor(book_id))) +
+  geom_density(adjust=3) +
+  geom_density(aes(x = losing_team_prob), adjust=3) +
+  labs(x = "Win / Loss Probability") + 
+  theme_minimal()
+```
+
+This plot shows the densities of win / loss probabilities for the best performing and worst performing books (60 and 55 respectively). There is a significant difference between the two books. 
+
+
+
+## Predicting For Closing Line Value
+
+### National Football League (NFL)
+
+```{r}
+set.seed(121)
+load("CLV_Analysis/NFL_Data/NFL_movement_split_df.rdata")
+NFL_Full <- NFL_lines_split %>%
+  select(-Index, -inserted, -league, -id, -Final_line, -public_team_under, -book_id) 
+```
+
+#### Logistic Analysis
+
+##### Model Setting
+
+```{r}
+# Make sure you set reference level (the outcome you are NOT interested in)
+NFL_Full <- NFL_Full %>%
+  mutate(outcome = relevel(factor(make_bet), ref='No')) #set reference level
+NFL_cv10 <- vfold_cv(NFL_Full, v = 10)
+# Logistic Regression Model Spec
+logistic_spec <- logistic_reg() %>%
+    set_engine('glm') %>%
+    set_mode('classification')
+# Recipe
+logistic_rec <- recipe(make_bet ~ money_line + spread + total + team_total + Location, data = NFL_Full, family = binomial('logit'), maxit = 100) %>%
+    step_normalize(all_numeric_predictors()) %>% 
+    step_dummy(all_nominal_predictors())
+# Workflow (Recipe + Model)
+log_wf <- workflow() %>% 
+    add_recipe(logistic_rec) %>%
+    add_model(logistic_spec) 
+# Fit Model to Training Data
+log_fit <- fit(log_wf, data = NFL_Full)
+```
+
+##### Checking Model
+
+```{r}
+# Print out Coefficients
+log_fit %>% tidy() %>%
+  kbl(caption = "Logistic Model Coefficients") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+# Get Exponentiated coefficients + CI
+log_fit %>% tidy() %>%
+  mutate(OR.conf.low = exp(estimate - 1.96*std.error), OR.conf.high = exp(estimate + 1.96*std.error)) %>% # do this first
+  mutate(OR = exp(estimate)) %>%
+  kbl(caption = "Logistic Model Exponentiated Coefficients and Confidence Interval") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+These two tables show us the effect that each variable has on the odds the logistic model tells us to make a bet or not. As we can see, variables like money line and team total show positive coefficients, referencing that an increase in money line or the current over/under line set for the game points towards a greater likelihood that the line will eventually move in your favor. The other two quantitative variables are the opposite, showing negative effects on the chances of choosing to bet on the game, with being the home team representing a categorical predictor that positively effects the odds of the line moving in your favor. One final note is the outputs for the 95% confidence ratios and the p-values which all show statistical significance for each variable 
+
+##### Making Predictions 
+
+```{r, results='hide'}
+# Make soft (probability) predictions
+predict(log_fit, new_data = NFL_Full, type = "prob")
+# Make hard (class) predictions (using a default 0.5 probability threshold)
+predict(log_fit, new_data = NFL_Full, type = "class")
+```
+
+##### Training Data Predictions
+
+```{r, warning=FALSE}
+# Soft predictions
+logistic_output <-  NFL_Full %>%
+  bind_cols(predict(log_fit, new_data = NFL_Full, type = 'prob')) 
+# Hard predictions (you pick threshold)
+logistic_output <- logistic_output %>%
+  mutate(.pred_class = make_two_class_pred(.pred_No, levels(outcome), threshold = .60)) #Try changing threshold (.5, 0, 1, .2, .8)
+# Visualize Soft Predictions
+logistic_output %>%
+  ggplot(aes(x = outcome, y = .pred_Yes)) +
+  geom_boxplot() + 
+  geom_hline(yintercept = 0.60, color='red') +  # try changing threshold
+  labs(y = 'Predicted Probability of Outcome', x = 'Observed Outcome') +
+  theme_classic()
+```
+
+From this predicted probability plot, we actually notice a result where if our desired threshold of 0.6 is used, we would actually never decide upon betting on the game. Our logistic model is not at least 60% sure that the line will move in our favor for any of the games in the data set. This is problematic and therefore makes it difficult to have confidence in the logistic model.
+
+##### Evaluating Model
+
+```{r}
+# Confusion Matrix
+conf <- logistic_output %>%
+  conf_mat(truth = outcome, estimate = .pred_class)
+log_metrics <- metric_set(sens, yardstick::spec, accuracy) # these metrics are based on hard predictions
+#sens: sensitivity = chance of correctly predicting second level, given second level (Yes)
+#spec: specificity = chance of correctly predicting first level, given first level (No)
+#accuracy: accuracy = chance of correctly predicting outcome
+logistic_output %>% 
+  log_metrics(estimate = .pred_class, truth = outcome, event_level = "second")  %>%
+  kbl(caption = "Logistic Model Metric Results") %>%
+  kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+This table on the other hand shows what the results for sensitivity, specificity, and accuracy would be when using a threshold of 0.5. Interestingly, we actually get a solid output for sensitivity of 0.73773, and while this is for a model that still sparsely selects to bet on the game, it is at least true that it is more important to have a higher sensitivity than any of the metrics (while the others are still important) and that shows with this model.
+
+##### ROC Curve
+
+```{r}
+logistic_roc <- logistic_output %>% 
+    roc_curve(outcome, .pred_Yes, event_level = "second") # set second level of outcome as "success"
+ROC <- autoplot(logistic_roc) + theme_classic() + labs(title = "ROC Curve for Logistic Model")
+ggplotly(ROC)
+```
+
+Similarly, the trand of the ROC curve remaining extremely close to a linear model with correlation of one shows positive output for the logistic model. That being said though we still want to focus more heavily on maximizing sensitivity compared to 1-specificity.
+
+##### CV Evaluation of Model
+
+```{r}
+# CV Fit Model
+log_cv_fit <- fit_resamples(
+    log_wf, 
+    resamples = NFL_cv10,
+    metrics = metric_set(sens, yardstick::spec, accuracy, roc_auc),
+    control = control_resamples(save_pred = TRUE, event_level = 'second'))  # you need predictions for ROC calculations
+collect_metrics(log_cv_fit) %>% #default threshold is 0.5
+  kbl(caption = "Logistic Model Metric CV Fold Test Results") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+This table above displays the error metrics that result from running our logistic model on training data produced through a CV Fold process with 10 folds. This actually shows a much different story from before, once again discrediting the logistic model by displaying an incredibly poor sensitivity of 0.0484. What this model does tell us though is that if you lean towards not betting on a game, you will still be able to have a relatively good accuracy, not a huge help to trying to win money but an important story nonetheless. 
+
+#### Random Forest Analysis
+
+##### Building Forest
+
+```{r}
+# Model Specification
+rf_spec <- rand_forest() %>%
+  set_engine(engine = 'ranger') %>% 
+  set_args(mtry = NULL, # size of random subset of variables; default is floor(sqrt(number of total predictors))
+           trees = 1000, # Number of trees
+           min_n = 2,
+           probability = FALSE, # FALSE: get hard predictions (not needed for regression)
+           importance = 'impurity') %>% # we'll come back to this at the end
+  set_mode('classification') # change this for regression
+# Recipe
+data_rec <- recipe(make_bet ~ money_line + spread + total + team_total + Location, data = NFL_Full)
+# Workflows
+data_wf_mtry2 <- workflow() %>%
+  add_model(rf_spec %>% set_args(mtry = 2)) %>%
+  add_recipe(data_rec)
+## Create workflows for mtry = 12, 74, and 147
+data_wf_mtry5 <- workflow() %>%
+  add_model(rf_spec %>% set_args(mtry = 5)) %>%
+  add_recipe(data_rec)
+```
+
+##### Fitting Models
+
+```{r}
+NFL_Full <- NFL_Full %>%
+  na.omit()
+set.seed(121) # make sure to run this before each fit so that you have the same 1000 trees
+data_fit_mtry2 <- fit(data_wf_mtry2, data = NFL_Full)
+set.seed(121) 
+data_fit_mtry5 <- fit(data_wf_mtry5, data = NFL_Full)
+```
+
+##### Making Out-Of-Bounds Predictions
+
+```{r, results='hide'}
+# Custom Function to get OOB predictions, true observed outcomes and add a user-provided model label
+rf_OOB_output <- function(fit_model, model_label, truth){
+    tibble(
+          .pred_class = fit_model %>% extract_fit_engine() %>% pluck('predictions'), #OOB predictions
+          make_bet = truth,
+          label = model_label
+      )
+}
+#check out the function output
+rf_OOB_output(data_fit_mtry5,5, NFL_Full %>% pull(make_bet))
+rf_OOB_output(data_fit_mtry2,2, NFL_Full %>% pull(make_bet))
+```
+
+##### Evaluating Models
+
+```{r}
+# Evaluate OOB Metrics
+data_rf_OOB_output <- bind_rows(
+    #rf_OOB_output(data_fit_mtry6,6, NFL_Full %>% pull(make_bet)),
+    rf_OOB_output(data_fit_mtry5,5, NFL_Full %>% pull(make_bet)),
+    rf_OOB_output(data_fit_mtry2,2, NFL_Full %>% pull(make_bet))
+  
+)
+data_rf_OOB_output %>% 
+    group_by(label) %>%
+    accuracy(truth = factor(make_bet), estimate = .pred_class) %>%
+    kbl(caption = "Random Forest Models Accuracy Metrics") %>%
+    kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+This table above shows the accuracy metrics on the out-of-bounds predictions produced by the two random forest models produced, one with an mtry of 2 and one with an mtry of 5, meaning all the variables were included. We actually notice that there is not much of a difference at all in the accuracy of these two models, both showing impressive accuracy of over 96%.
+
+```{r, warning=FALSE}
+mtry2Conf <- rf_OOB_output(data_fit_mtry2,2, NFL_Full %>% pull(make_bet)) %>%
+    conf_mat(truth = make_bet, estimate= .pred_class)
+mtry5Conf <- rf_OOB_output(data_fit_mtry5,5, NFL_Full %>% pull(make_bet)) %>%
+    conf_mat(truth = make_bet, estimate= .pred_class)
+mtry2Conf <- as.data.frame.matrix(mtry2Conf$table)
+mtry5Conf <- as.data.frame.matrix(mtry5Conf$table)
+```
+
+```{r}
+mtry2Conf %>%
+    kbl(caption = "Random Forest Mtry 2 Model Confusion Matrix") %>%
+    kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+This table shows the confusion matrix for the random forest model with mtry = 2. What we notice from this, in addition to the accuracy measurements from before, is great improvement on the logistic model with a sensitivity of about 0.95 while still selecting to bet on about 43% of the games. 
+
+```{r}
+mtry5Conf %>%
+    kbl(caption = "Random Forest Mtry 5 Model Confusion Matrix") %>%
+    kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+This table is the confusion matrix for our other random forest model with an mtry of 5. This shows an even better sensitivity of slightly over 96% while choosing to bet on the exact same percentage of games as before at just below 43%.
+
+##### Variable Importance
+
+```{r}
+model_output <-data_fit_mtry5 %>% 
+    extract_fit_engine() 
+variableImp <- model_output %>% 
+    vip(num_features = 30) + theme_classic() + labs(title = "Random Forest Best Model Variable Importance", ylab = "Variable") #based on impurity
+ggplotly(variableImp)
+model_output %>% vip::vi() %>% head() %>%
+   kbl(caption = "Random Forest Best Model Variable Importance") %>%
+   kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+The table and graph above give ranked outputs of variable importance for each variable in our chosen model, which for now is the model with an mtry of 5. As we can see here, money line is out in front with easily the most importance, followed by the game total, with the home/away status of the team you are looking to bet on actually showing the least importance of any of these variables. 
+
+#### Decision Tree
+
+##### Fitting Tree
+
+```{r}
+ct_spec <- decision_tree() %>%
+  set_engine(engine = 'rpart') %>%
+  set_args(cost_complexity = 0.005,  #default is 0.01 (used for pruning a tree)
+           min_n = NULL, #min number of observations to try split: default is 20 [I think the documentation has a typo and says 2]  (used to stop early)
+           tree_depth = NULL) %>% #max depth, number of branches/splits to get to any final group: default is 30 (used to stop early)
+  set_mode('classification') # change this for regression tree
+data_rec <- recipe(make_bet ~ money_line + spread + total + team_total + Location , data = NFL_Full)
+data_wf <- workflow() %>%
+  add_model(ct_spec) %>%
+  add_recipe(data_rec)
+fit_mod <- data_wf %>% # or use tune_grid() to tune any of the parameters above
+  fit(data = NFL_Full)
+```
+
+##### Visualizing Tree
+
+```{r, warning=FALSE}
+# Plot the tree (make sure to load the rpart.plot package first)
+fit_mod %>%
+  extract_fit_engine() %>%
+  rpart.plot()
+# Get variable importance metrics 
+# Sum of the goodness of split measures (impurity reduction) for each split for which it was the primary variable.
+fit_mod %>%
+  extract_fit_engine() %>%
+  pluck('variable.importance') %>%
+   kbl(caption = "Decision Tree Variable Importance") %>%
+   kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+The graph above shows what has been selected as the best model decision tree for the data set. This tree has been pruned down by using a cost complexity of 0.05 to keep is visually interpretable, but something important to note is that you can see that many of the nodes being represented by money line, and that accompanies the fact that spread being greater than or equal to -12 is the root node. This is displayed in the accompanying table as well, which displays money line and spread as the two most important variables to the model.
+
+##### Making Predictions 
+
+```{r}
+# Hard (class) prediction
+prediction <- predict(fit_mod, new_data = NFL_Full, type = "class")
+```
+
+```{r}
+table_mat <- table(NFL_Full$make_bet, prediction$.pred_class)
+table_mat <-  as.data.frame.matrix(table_mat)
+table_mat %>%
+   kbl(caption = "Decision Tree Confusion Matrix") %>%
+   kable_classic(full_width = F, html_font = "Cambria") # set second level of outcome as "success"
+```
+
+This table displays the confusion matrix for the decision tree above. It is important to note that, although this is supposed to give some sort of visual interpretation of what may be going on inside of the random forests model, the heavy pruning has left this tree with a much lower accuracy of about 0.61 and a sensitivity of about 0.63. In addition this decision tree runs closer to the logistic model than the random forest in the sense that the decision tree model is much less likely to predict that one should bet on the game than to say to avoid it.
+
+## Next Steps
+
+### Closing Line Value Next Steps
+Joe is working on this.
+
+Currently we are working to double check the results of the random forest model for the NFL. The accuracy and sensitivity results were staggeringly good, so we are investigating to make sure there are not any leaks in the data that making our predictions unreasonably good.
+
+Following that investigation, if all works out the next goal will be to try to make our random forest interpretable. We have found a package called rfviz which is meant to visualize random forests along will turning a random forest into a model that looks similar to a logistic model output, using variable importance to produce coefficients. This is an important step to allowing people to actually use our models in the future on real life games.
+
+Finally, after wrapping up the NFL the next step will be to apply these methods to other sports. Particularly data is already available for us in NCAA football, MLB, NHL, and NBA.
+
+
+### Expected Value Arbitrage
+Declan is working on this.
+
+By Thanksgiving break we want to have a final model for baseline expected value as well as visualizations that are more interpretable. Having a final model for baseline expected value is a huge next step and will allow us to continue with our analysis.
+
+Once the baseline expected value has been calculated, we want to find a way to analyze and / or simulate arbitrage betting using our expected value. We hope to have this done a week after we get back from Thanksgiving. This will allow us time to fine tune our final work and project write up.
+
+### Contributions
+
+Joe worked on the introduction and closing line value. Declan worked on expected value arbitrage betting and the data portion.
